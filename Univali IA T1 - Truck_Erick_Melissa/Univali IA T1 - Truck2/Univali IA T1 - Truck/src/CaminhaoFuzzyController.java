@@ -94,19 +94,11 @@ public class CaminhaoFuzzyController {
 	}
 
 	// -------------------------------------------------------------------------
-	// Controlador principal — 100% fuzzy, sem máquina de estados
+	// Controlador principal — 100% fuzzy, sem comutação de estados discretos
 	// -------------------------------------------------------------------------
 	//
-	// Ideia central: em vez de comutar entre estados discretos (0→1→2→3),
-	// calculamos o grau de ativação de 3 MODOS de comportamento e produzimos
-	// volante/velocidade como média ponderada dos 3 modos.
-	//
-	//   Modo A (wApproach): longe do pré-ponto → navegar até (preX, preY)
-	//   Modo B (wAlign)   : perto do pré-ponto, desalinhado → corrigir ângulo/x
-	//   Modo C (wEnter)   : alinhado e centrado → avançar para dentro da vaga
-	//
-	// As transições entre modos são CONTÍNUAS — o sistema nunca "troca de estado",
-	// apenas redistribui os pesos à medida que a situação muda.
+	// Ideia central: volante/velocidade saem de regras fuzzy contínuas que
+	// equilibram aproximar o pré-ponto, alinhar e entrar na vaga.
 	// -------------------------------------------------------------------------
 	public Controle calcular(double x, double y, double ang, boolean colidiu, int diffTime) {
 		final double vagaX  = 400;
@@ -155,69 +147,63 @@ public class CaminhaoFuzzyController {
 		// pré-ponto em direção à vaga (protege contra rever para modo A)
 		double mJaEntrou = trapezoidal(progressoEntrada, 0.03, 0.12, 1.0, 1.1);
 
-		// "Na zona de pré-posicionamento": perto do pré-ponto OU já iniciou a entrada
-		double mNaStage  = Math.max(triangular(distPre, 0, 0, 80), mJaEntrou);
-
-		// "Longe da zona de pré-posicionamento"
-		double mForaStage = 1.0 - mNaStage;
+		// Distâncias ao pré-ponto (aproximação) — sem estados, apenas pertinência
+		double mPertoPre = triangular(distPre, 0, 0, 120);
+		double mLongePre = triangular(distPre, 80, 240, 520);
 
 		// =====================================================================
-		// BLOCO 2 — Pesos de ativação dos 3 modos de comportamento
+		// BLOCO 2 — Força das regras fuzzy
 		// =====================================================================
 		//
-		// Modo A ativo quando longe do pré-ponto.
-		// Modo B ativo quando na zona, mas não alinhado/centrado.
-		// Modo C ativo quando na zona E alinhado E centrado.
-		//
-		// Note que wB + wC = mNaStage, e a soma total = mForaStage + mNaStage = 1
-		// antes de qualquer saturação, garantindo que sempre haja comportamento.
+		// Regra A: longe do pré-ponto -> aproximar do pré-ponto
+		// Regra B: perto do pré-ponto e desalinhado -> alinhar
+		// Regra C: alinhado/centrado ou já entrou -> entrar na vaga
+		double rAproximar = mLongePre * (1.0 - mJaEntrou);
+		double rAlinhar   = mPertoPre * (1.0 - mAlinhado * mCentrado) * (1.0 - mJaEntrou);
+		double rEntrar    = Math.max(mJaEntrou, mPertoPre * mAlinhado * mCentrado);
 
-		double wApproach = mForaStage;
-		double wAlign    = mNaStage * (1.0 - mAlinhado * mCentrado);
-		double wEnter    = mNaStage * mAlinhado * mCentrado;
-
-		double totalW = wApproach + wAlign + wEnter;
+		double totalW = rAproximar + rAlinhar + rEntrar;
 		if (totalW < 1e-9) totalW = 1e-9;
 
 		// =====================================================================
 		// BLOCO 3 — Cálculo do volante por modo
 		// =====================================================================
 
-		// Modo A: apontar e seguir em direção ao pré-ponto
+		// Regra A: apontar e seguir em direção ao pré-ponto
 		double angPre      = Math.atan2(preY - y, preX - x);
 		double erroPre     = Math.toDegrees(normalizaAngulo(angPre - ang));
-		double steerApproach = fuzzyVolante(erroPre);
+		double steerAproximar = fuzzyVolante(erroPre);
 
-		// Modo B: corrigir o ângulo final (−90°) e centralizar em x=vagaX
-		double steerAlign  = fuzzyVolante(erroAngFinalGraus) + limita(erroX * 0.8, -32, 32);
+		// Regra B: corrigir o ângulo final (−90°) e centralizar em x=vagaX
+		double steerAlinhar = fuzzyVolante(erroAngFinalGraus) + limita(erroX * 0.8, -32, 32);
 
-		// Modo C: guiar diretamente para a entrada da vaga, corrigindo x
+		// Regra C: guiar diretamente para a entrada da vaga, corrigindo x
 		double angEntrada  = Math.atan2(vagaY - y, vagaX - x);
 		double erroEntrada = Math.toDegrees(normalizaAngulo(angEntrada - ang));
-		double steerEnter  = fuzzyVolante(erroEntrada) * 0.65 + erroX * 1.15;
+		double steerEntrar = fuzzyVolante(erroEntrada) * 0.65 + erroX * 1.15;
 
-		// Defuzzificação do volante: média ponderada pelos pesos dos modos
-		double steer = (wApproach * steerApproach + wAlign * steerAlign + wEnter * steerEnter) / totalW;
+		// Defuzzificação do volante: média ponderada pelas forças das regras
+		double steer = (rAproximar * steerAproximar + rAlinhar * steerAlinhar + rEntrar * steerEntrar) / totalW;
 
 		// =====================================================================
 		// BLOCO 4 — Cálculo da velocidade por modo
 		// =====================================================================
 
-		// Modo A: velocidade fuzzy baseada em distância e desalinhamento ao pré-ponto
-		double velApproach = fuzzyVelocidade(distPre, Math.abs(erroPre));
+		// Regra A: velocidade fuzzy baseada em distância e desalinhamento ao pré-ponto
+		double velAproximar = fuzzyVelocidade(distPre, Math.abs(erroPre));
 
-		// Modo B: devagar enquanto faz a manobra de alinhamento
-		double velAlign    = 30.0;
+		// Regra B: devagar enquanto faz a manobra de alinhamento
+		double velAlinhar = 30.0;
 
-		// Modo C: velocidade de entrada com suavização ao chegar no alvo.
+		// Regra C: velocidade de entrada com suavização ao chegar no alvo.
 		// Se o caminhão ultrapassou a vaga (y < vagaY), reduz progressivamente
 		// até reverter, usando pertinência fuzzy de "sobrepassou".
 		double mSobrepassou  = limita((vagaY - y) / 8.0, 0.0, 1.0);
 		double velEnterBase  = limita(fuzzyVelocidade(distVaga, Math.abs(erroEntrada)), 14, 42);
-		double velEnter      = velEnterBase * (1.0 - mSobrepassou) - 14.0 * mSobrepassou;
+		double velEntrar     = velEnterBase * (1.0 - mSobrepassou) - 14.0 * mSobrepassou;
 
-		// Defuzzificação da velocidade: média ponderada pelos pesos dos modos
-		double vel = (wApproach * velApproach + wAlign * velAlign + wEnter * velEnter) / totalW;
+		// Defuzzificação da velocidade: média ponderada pelas forças das regras
+		double vel = (rAproximar * velAproximar + rAlinhar * velAlinhar + rEntrar * velEntrar) / totalW;
 
 		return new Controle(limita(steer, -90, 90), vel);
 	}
